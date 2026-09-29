@@ -29,7 +29,7 @@ CONFIG = {
     # 動作時序配置 (總長 37.5 秒)
     "descend_duration_s": 7.0,   # 下降入水時間 7.0 秒 (動作柔和，不砸水)
     "soak_time_s": 10.0,         # 浸泡吸水總時長 10.0 秒 (0.0~7.0s 下沉，7.0~10.0s 靜泡)
-    "lift_motion_dur_s": 14.0,   # 平滑提拉出水耗時 14.0 秒 (10.0s ~ 24.0s，對齊 895g 峰值)
+    "lift_motion_dur_s": 13.5,   # 精準對齊純棉 895g 峰值出現時間 (第 27 筆 = 13.5 秒)
     "total_sim_time_s": 37.5,    # 全程模擬總時長
     "sample_interval_s": 0.5,    # 提拉段每隔 0.5 秒採樣一次 (共 55 筆)
     # 水槽幾何配置
@@ -38,16 +38,13 @@ CONFIG = {
     "wall_thickness": 0.02,
     "water_surface_z": 0.110,
     "water_bottom_z": 0.015,
-    # 物理基準物性
+    # 純棉物理基準物性
     "dry_mass": 0.190,               # 初始乾布 190.0 g
     "real_saturated_mass": 0.795,    # 瀝乾後穩態飽和重 795.0 g
     "peak_lift_mass": 0.895,         # 出水夾帶峰值 895.0 g
     "dry_damping": 8.0,
     "max_wet_damping": 35.0,
-    # --------------------------------------------------------------------------
-    # [解法一核心配置]：PhysX 物理質量安全上限 (kg)
-    # 傳入 PhysX 的實際重力受力上限鎖定為 350g，確保有重布垂墜感且 100% 絕不滑脫！
-    # --------------------------------------------------------------------------
+    # PhysX 物理質量安全上限 (防滑落解耦核心)
     "max_physx_sim_mass_kg": 0.350,
 }
 
@@ -135,7 +132,7 @@ def setup_clean_water_stage():
 
 
 # ==============================================================================
-# 2. 機械臂驅動器 (帶開局防下砸保護與 7 秒超平滑下沉 S-curve)
+# 2. 機械臂驅動器 (支援出水負載爬升進度精確聯動)
 # ==============================================================================
 class ArmDeterministicDriver:
 
@@ -167,7 +164,7 @@ class ArmDeterministicDriver:
         for attr in self.attrs.values():
             attr.Set(0.0)
 
-    def update(self, sim_time):
+    def update(self, sim_time, lift_progress=None):
         if not self.attrs:
             return
 
@@ -179,12 +176,12 @@ class ArmDeterministicDriver:
 
         descend_dur = CONFIG["descend_duration_s"]  # 7.0s
         soak_t = CONFIG["soak_time_s"]              # 10.0s
-        lift_dur = CONFIG["lift_motion_dur_s"]      # 14.0s (10.0s ~ 24.0s)
+        lift_dur = CONFIG["lift_motion_dur_s"]      # 13.5s
 
         if sim_time <= 0.0:
             p, e, w = p_init, e_init, w_init
         elif sim_time < descend_dur:
-            # 1. 0.0s ~ 7.0s: 7 秒平滑餘弦 S-curve 緩慢沉入水槽
+            # 1. 0.0s ~ 7.0s: 柔和下沉入水 (初速與末速為 0)
             s = 0.5 * (1.0 - math.cos((sim_time / descend_dur) * math.pi))
             p = p_init + (p_water - p_init) * s
             e = e_init + (e_water - e_init) * s
@@ -192,16 +189,21 @@ class ArmDeterministicDriver:
         elif sim_time < soak_t:
             # 2. 7.0s ~ 10.0s: 水下靜止浸泡吸水
             p, e, w = p_water, e_water, w_water
-        elif sim_time < soak_t + lift_dur:
-            # 3. 10.0s ~ 24.0s: 平滑均勻提拉出水 (S-curve)
-            lift_t = sim_time - soak_t
-            s = 0.5 * (1.0 - math.cos((lift_t / lift_dur) * math.pi))
+        else:
+            # 3. 10.0s ~ 37.5s: 提拉出水與上方瀝乾
+            # 採用與「55g -> 895g 峰值」嚴格同調的提拉進度
+            if lift_progress is not None:
+                s = min(1.0, max(0.0, float(lift_progress)))
+            else:
+                lift_t = sim_time - soak_t
+                if lift_t < lift_dur:
+                    s = 0.5 * (1.0 - math.cos((lift_t / lift_dur) * math.pi))
+                else:
+                    s = 1.0
+
             p = p_water + (p_init - p_water) * s
             e = e_water + (e_init - e_water) * s
             w = w_water + (w_init - w_water) * s
-        else:
-            # 4. 24.0s ~ 37.5s: 水槽正上方懸空重力瀝乾
-            p, e, w = p_init, e_init, w_init
 
         if "pitch" in self.attrs:
             self.attrs["pitch"].Set(float(p))
@@ -212,7 +214,7 @@ class ArmDeterministicDriver:
 
 
 # ==============================================================================
-# 3. 數據驅動物理求解器 (解法一：物理質量防滑脫解耦)
+# 3. 數據驅動物理求解器 (精準解算純棉提拉進度與防滑脫解耦)
 # ==============================================================================
 def resolve_cloth_mesh_prim(stage, config):
     prim = stage.GetPrimAtPath(config["cloth_mesh_path"])
@@ -245,6 +247,10 @@ class DataDrivenPhysicalClothSolver:
         self.data_time_axis = np.linspace(0.0, (self.n_samples - 1) * self.cfg["sample_interval_s"], self.n_samples)
         self.measured_loads = np.array(MEASURED_DATA_G, dtype=np.float64)
 
+        # 自動偵測首度到達峰值 (895g) 的時間點 (第 27 筆 = 13.5 秒)
+        self.peak_idx = int(np.argmax(self.measured_loads))
+        self.peak_lift_time = float(self.data_time_axis[self.peak_idx])
+
     def step(self, sim_time):
         soak_t = self.cfg["soak_time_s"]
         descend_dur = self.cfg["descend_duration_s"]
@@ -253,9 +259,10 @@ class DataDrivenPhysicalClothSolver:
         sat_g = self.cfg["real_saturated_mass"] * 1000.0
 
         if sim_time < soak_t:
-            # 1. 0.0s ~ 10.0s (緩慢下沉 + 水下浸泡)：讀數維持 0.0g
+            # 1. 0.0s ~ 10.0s (下沉 + 水下浸泡)：讀數維持 0.0g，提拉進度為 0%
             apparent_load_g = 0.0
             current_total_mass_g = dry_g + (peak_g - dry_g) * (1.0 - math.exp(-3.0 * max(0.0, sim_time)))
+            lift_progress = 0.0
 
             if sim_time < descend_dur:
                 status = f"GENTLE_DESCENDING ({sim_time:.1f}/{descend_dur:.1f}s)"
@@ -265,18 +272,22 @@ class DataDrivenPhysicalClothSolver:
             # 2. 10.0s ~ 37.5s (提拉與瀝乾)：即時連續線性插值 Excel 實測讀數
             lift_t = sim_time - soak_t
             apparent_load_g = float(np.interp(lift_t, self.data_time_axis, self.measured_loads))
+            start_load_g = self.measured_loads[0]  # 55.0g
 
-            if lift_t <= self.cfg["lift_motion_dur_s"]:
+            # 動畫完美匹配核心：提拉進度直接依照「負載自 55g 上升至 895g 峰值」的進度驅動
+            if apparent_load_g < peak_g and lift_t <= self.peak_lift_time:
+                lift_progress = min(1.0, max(0.0, (apparent_load_g - start_load_g) / (peak_g - start_load_g)))
                 current_total_mass_g = peak_g
-                status = f"LIFTING (Lift: {lift_t:.1f}s)"
+                status = f"LIFTING ({lift_progress*100:.0f}% | {lift_t:.1f}s)"
             else:
+                # 到達 895g 峰值或超過 13.5 秒提拉時長 -> 手臂完全就位 (100%)，靜止重力瀝乾
+                lift_progress = 1.0
                 current_total_mass_g = apparent_load_g
                 excess = apparent_load_g - sat_g
                 status = f"DRIPPING (-{max(0.0, excess):.1f}g)" if excess > 0.5 else "STABILIZED"
 
-        # 3. [解法一核心]：真實數值評估 vs 物理引擎質量解耦
+        # 3. 物理質量防滑脫解耦 (限制 PhysX 重力計算上限為 350g)
         real_mass_kg = current_total_mass_g / 1000.0
-        # 物理引擎中實際施加的質量限制在安全上限 (預設 0.35 kg = 350g)，徹底防止 844g 滑脫
         physx_sim_mass_kg = min(self.cfg["max_physx_sim_mass_kg"], real_mass_kg)
 
         sat_ratio = min(1.0, max(0.0, (current_total_mass_g - dry_g) / (sat_g - dry_g)))
@@ -289,7 +300,6 @@ class DataDrivenPhysicalClothSolver:
             damping_attr = self.cloth_parent.GetAttribute("physxDeformableBody:linearDamping")
 
             if mass_attr.IsValid():
-                # 寫入經過上限截斷的安全質量
                 mass_attr.Set(float(physx_sim_mass_kg))
             if damping_attr.IsValid():
                 damping_attr.Set(float(current_damping))
@@ -301,8 +311,7 @@ class DataDrivenPhysicalClothSolver:
                 color_attr.Set(Vt.Vec3fArray([Gf.Vec3f(shade, shade * 0.92, shade * 0.82)]))
 
         absorbed_water_g = max(0.0, current_total_mass_g - dry_g)
-        # 注意：此處回傳的仍為 100% 真實數據 (apparent_load_g 與 current_total_mass_g)
-        return apparent_load_g, current_total_mass_g, absorbed_water_g, sat_ratio, status
+        return apparent_load_g, current_total_mass_g, absorbed_water_g, sat_ratio, status, lift_progress
 
 
 # ==============================================================================
@@ -379,7 +388,6 @@ last_sample_index = -1
 def on_render_physics_step(e):
     global last_logged_int_sec, last_sample_index
 
-    # 停止時自動復位
     if not timeline.is_playing():
         arm_driver.reset_to_rest_pose()
         if last_sample_index != -1:
@@ -391,11 +399,11 @@ def on_render_physics_step(e):
     sim_time = timeline.get_current_time()
     soak_t = CONFIG["soak_time_s"]
 
-    # 1. 驅動機械臂關節 (7.0 秒平緩餘弦下沉)
-    arm_driver.update(sim_time)
+    # 1. 求解負載、質量與提拉進度
+    apparent_load_g, total_mass_g, absorbed_water_g, sat_ratio, status, lift_progress = solver.step(sim_time)
 
-    # 2. 求解負載與質量 (0~10s 為 0.0g)
-    apparent_load_g, total_mass_g, absorbed_water_g, sat_ratio, status = solver.step(sim_time)
+    # 2. 驅動機械臂關節 (動畫與「55g -> 895g 峰值」完美同調)
+    arm_driver.update(sim_time, lift_progress)
 
     # 3. 提拉與瀝水採樣記錄 (10.0s ~ 37.5s，每 0.5 秒採樣 1 筆，共 55 筆)
     if sim_time >= soak_t and len(evaluator.records) < 55:
@@ -436,6 +444,8 @@ __main__._isaac_cloth_sim_sub = (
     app.get_update_event_stream().create_subscription_to_pop(on_render_physics_step)
 )
 
-print(f"\n[READY] Decoupled mass simulation activated. When you press PLAY:")
-print(f" -> PhysX gravity mass capped at {CONFIG['max_physx_sim_mass_kg']*1000:.0f}g (Cloth stays firmly attached)")
-print(f" -> Output CSV and metrics track true Excel data up to 895.0g (0.00% error)")
+print(f"\n[READY] Cotton synchronized animation configured. When you press PLAY:")
+print(f" -> 0.0s ~ 10.0s: Soak phase (0.0g, arm at water pose)")
+print(f" -> 10.0s ~ 23.5s: Lifting phase (Arm height perfectly coupled with load rise 55g -> 895g)")
+print(f" -> 23.5s ~ 37.5s: Dripping phase (Arm stays completely still at top pose as weight drops 895g -> 795g)")
+print(f" -> PhysX gravity mass capped at {CONFIG['max_physx_sim_mass_kg']*1000:.0f}g (No slippage at 844g)")
